@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "band-booking-mesh": {
+      "command": "python",
+      "args": ["-m", "band_mcp_server"],
+      "env": {
+        "BAND_AGENT_KEY": "band_u_1791173158_Vi6rX_jVuYx9mk54TZTJDnavLGLco3aa",
+        "BAND_BASE_URL": "https://app.band.ai"
+      }
+    }
+  }
+}
