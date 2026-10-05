@@ -1,31 +1,34 @@
 import asyncio
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
 import zoneinfo
-
-# Import the Band Multi-Agent Coordination Mesh Layer
-# Ensure you run `pip install band-sdk` inside your isolated git worktree
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+import uuid
 
 # ==========================================
-# BASE DATA MODELS & CORE BOOKING ENGINE
+# CORE TYPES & DATASTRUCTURES
 # ==========================================
+@dataclass(frozen=True)
 class Table:
-    def __init__(self, table_id: str, capacity: int, regional_id: str):
-        self.table_id = table_id
-        self.capacity = capacity
-        self.regional_id = regional_id
+    table_id: str
+    capacity: int
+    regional_id: str  # Maps directly to visual explorer requirements
 
+@dataclass
 class Reservation:
-    def __init__(self, res_id: str, party_size: int, start_time: datetime, duration_hours: float = 2.0):
-        self.res_id = res_id
-        self.party_size = party_size
-        self.start_time = start_time
-        self.end_time = start_time + timedelta(hours=duration_hours)
-        self.table_id: Optional[str] = None
-        self.status: str = "INIT"
-        self.escrow_held: float = 0.0
+    res_id: str
+    party_size: int
+    start_time: datetime  # Timezone-aware
+    end_time: datetime    # Timezone-aware
+    table_id: Optional[str] = None
+    status: str = "INIT"  # INIT, PENDING, CONFIRMED, CANCELLED, NOSHOW
+    escrow_held: float = 0.0
 
+# ==========================================
+# MULTI-LOCATION MULTI-TIMEZONE ENGINE
+# ==========================================
 class RegionalBookingEngine:
+    """Manages isolated region ledgers and state mutation under explicit local locks."""
     def __init__(self, location_id: str, timezone_str: str, tables: List[Table]):
         self.location_id = location_id
         self.tz = zoneinfo.ZoneInfo(timezone_str)
@@ -33,14 +36,22 @@ class RegionalBookingEngine:
         self.reservations: Dict[str, Reservation] = {}
         self.lock = asyncio.Lock()
 
+    def get_local_time(self, dt: datetime) -> datetime:
+        return dt.astimezone(self.tz)
+
     async def check_availability(self, start: datetime, end: datetime, party_size: int) -> Optional[str]:
+        """Scans for an open un-booked table fitting matching sizing blocks."""
         eligible_tables = [t for t in self.tables if t.capacity >= party_size]
         if not eligible_tables:
             return None
-        active_res = [r for r in self.reservations.values() if r.status in ("PENDING", "CONFIRMED")]
+
+        # Filter out inactive states (Only evaluate active PENDING or CONFIRMED holds)
+        active_res = [r for r in self.reservations.values() if r.status in ("INIT", "PENDING", "CONFIRMED")]
+        
         for table in eligible_tables:
             overlap = False
             for res in [r for r in active_res if r.table_id == table.table_id]:
+                # STRICT OVERLAP CHECK: True if intervals intersect at all
                 if not (end <= res.start_time or start >= res.end_time):
                     overlap = True
                     break
@@ -49,10 +60,12 @@ class RegionalBookingEngine:
         return None
 
     async def attempt_booking(self, res: Reservation) -> Tuple[bool, str]:
+        """Enforces Time-Slot Allocation Isolation to eliminate double-booking."""
         async with self.lock:
             loc_start = res.start_time.astimezone(self.tz)
             if loc_start.hour < 11 or loc_start.hour > 22:
-                return False, f"Target slot ({loc_start.hour}:00) falls outside operational regional hours."
+                return False, f"Target slot ({loc_start.hour}:00) falls outside operational regional hours (11:00-23:00)."
+
             assigned_table = await self.check_availability(res.start_time, res.end_time, res.party_size)
             if assigned_table:
                 res.table_id = assigned_table
@@ -61,128 +74,157 @@ class RegionalBookingEngine:
                 return True, f"Successfully held table {assigned_table}."
             return False, "No spatial/temporal matrix gap matching criteria found."
 
-# =========================================================
-# BAND DESKTOP AGENT LAYER (Framework-Agnostic Coordination)
-# =========================================================
-#mesh = BandAgentMesh(agent_id="booking_mesh_coordinator")
-
-# class BandNegotiationAgents:
-#     """Publishes capabilities to the BAND Agentic Mesh for multi-peer runtime discovery."""
-
-#     @mesh.register_agent(name="SlotBuilderAgent")
-    # class BuilderAgent:
-    #     def __init__(self, engine: RegionalBookingEngine, partners: List[RegionalBookingEngine]):
-    #         self.engine = engine
-    #         self.partners = partners
-
-    #     @band_tool(description="Synthesizes system proposals for shifting schedules or cross-node venues.")
-    #     async def propose_alternatives(self, res_id: str, party_size: int, start_iso: str, end_iso: str) -> dict:
-    #         start = datetime.fromisoformat(start_iso)
-    #         end = datetime.fromisoformat(end_iso)
-    #         proposals = []
-            
-    #         # 1. Scan localized temporal slots
-    #         for shift_hours in [1, 2]:
-    #             new_start = start + timedelta(hours=shift_hours)
-    #             new_end = end + timedelta(hours=shift_hours)
-    #             table_id = await self.engine.check_availability(new_start, new_end, party_size)
-    #             if table_id:
-    #                 proposals.append({
-    #                     "node": self.engine.location_id, 
-    #                     "start": new_start.isoformat(), 
-    #                     "end": new_end.isoformat()
-    #                 })
-
-    #         # 2. Query partner environments connected to the shared control plane mesh
-    #         for partner in self.partners:
-    #             p_start = start.astimezone(partner.tz)
-    #             p_end = end.astimezone(partner.tz)
-    #             table_id = await partner.check_availability(p_start, p_end, party_size)
-    #             if table_id:
-    #                 proposals.append({
-    #                     "node": partner.location_id, 
-    #                     "start": p_start.isoformat(), 
-    #                     "end": p_end.isoformat()
-    #                 })
-
-    #         # Hand off context asynchronously to the Verifier agent inside the Band Room using an @mention routing trigger
-    #         await mention_agent(
-    #             agent_name="SlotVerifierAgent",
-    #             message=f"Reviewing {len(proposals)} options compiled for reservation {res_id}.",
-    #             payload={"proposals": proposals, "res_id": res_id, "party_size": party_size}
-    #         )
-    #         return {"status": "Dispatched to Verifier", "proposals_count": len(proposals)}
-
-    # @mesh.register_agent(name="SlotVerifierAgent")
-    # class VerifierAgent:
-    #     def __init__(self, engines: Dict[str, RegionalBookingEngine]):
-    #         self.engines = engines
-
-    #     @band_tool(description="Enforces strict double-booking bounds checking and issues final authority approval.")
-    #     async def verifier_audit(self, proposals: list, party_size: int) -> Optional[dict]:
-    #         for prop in proposals:
-    #             target_engine = self.engines.get(prop["node"])
-    #             if not target_engine:
-    #                 continue
+# ==========================================
+# SMART-CAPACITY WAITLIST MANAGER (LOCAL MATH)
+# ==========================================
+class NegotiationAgents:
+    """Implements core algorithmic shift capabilities used by the outer agent layer."""
+    @staticmethod
+    async def builder_propose_alternatives(
+        engine: RegionalBookingEngine, res: Reservation, partners: List[RegionalBookingEngine]
+    ) -> List[Tuple[RegionalBookingEngine, datetime, datetime]]:
+        proposals = []
+        
+        # 1. Look for internal time shifts (+60 mins or +120 mins)
+        time_shifts = [timedelta(hours=1), timedelta(hours=2)]
+        for shift in time_shifts:
+            new_start = res.start_time + shift
+            new_end = res.end_time + shift
+            table_id = await engine.check_availability(new_start, new_end, res.party_size)
+            if table_id:
+                proposals.append((engine, new_start, new_end))
                 
-    #             start = datetime.fromisoformat(prop["start"])
-    #             end = datetime.fromisoformat(prop["end"])
+        # 2. Look for fallback options at cooperative partner venues
+        for partner in partners:
+            p_start = res.start_time.astimezone(partner.tz)
+            p_end = res.end_time.astimezone(partner.tz)
+            table_id = await partner.check_availability(p_start, p_end, res.party_size)
+            if table_id:
+                proposals.append((partner, p_start, p_end))
                 
-    #             # Direct check against the isolated engine ledger status
-    #             table_id = await target_engine.check_availability(start, end, party_size)
-    #             if table_id:
-    #                 return {
-    #                     "approved": True,
-    #                     "node": prop["node"],
-    #                     "start": prop["start"],
-    #                     "end": prop["end"],
-    #                     "table_id": table_id
-    #                 }
-    #         return {"approved": False, "reason": "All structural alternative matrices occupied."}
+        return proposals
+
+    @staticmethod
+    async def verifier_audit(
+        proposals: List[Tuple[RegionalBookingEngine, datetime, datetime]], res: Reservation
+    ) -> Optional[Tuple[RegionalBookingEngine, datetime, datetime]]:
+        for target_engine, start, end in proposals:
+            table_id = await target_engine.check_availability(start, end, res.party_size)
+            if table_id:
+                return target_engine, start, end
+        return None
 
 # ==========================================
-# SIMULATION ORCHESTRATION PIPELINE
+# NO-SHOW PENALTY & HOLD SYSTEM
+# ==========================================
+class EscrowHoldCoordinator:
+    def __init__(self, grace_period_minutes: int = 15, deposit_amount: float = 50.0):
+        self.grace_period = timedelta(minutes=grace_period_minutes)
+        self.deposit_amount = deposit_amount
+
+    async def secure_hold(self, res: Reservation):
+        res.escrow_held = self.deposit_amount
+        print(f"[Escrow] Locked ${self.deposit_amount} deposit security window for Res {res.res_id}.")
+
+    async def execute_clock_monitor(self, engine: RegionalBookingEngine, res: Reservation):
+        cutoff_time = res.start_time + self.grace_period
+        now = datetime.now(res.start_time.tzinfo)
+        
+        delay_seconds = (cutoff_time - now).total_seconds()
+        # Ensure negative or near-zero values yield instantly without locking up the loop
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        else:
+            await asyncio.sleep(0.01) # Small yields prevent thread choking
+            
+        async with engine.lock:
+            current_res = engine.reservations.get(res.res_id)
+            if current_res and current_res.status == "PENDING":
+                current_res.status = "NOSHOW"
+                print(f"[Escrow Trigger] Penalty charged! Host captured ${current_res.escrow_held} from Res {res.res_id} due to no-show.")
+
+# ==========================================
+# GLOBAL SYNC AUDITOR
+# ==========================================
+class CentralizedAuditor:
+    @staticmethod
+    async def global_sanity_check(engines: List[RegionalBookingEngine]):
+        print("\n[Auditor Log] Starting Cross-Node Distributed State Audit...")
+        all_ok = True
+        for engine in engines:
+            async with engine.lock:
+                allocated_spans: Dict[str, List[Tuple[datetime, datetime]]] = {}
+                for res in engine.reservations.values():
+                    if res.status not in ("INIT", "PENDING", "CONFIRMED"):
+                        continue
+                    if res.table_id not in allocated_spans:
+                        allocated_spans[res.table_id] = []
+                    
+                    for start, end in allocated_spans[res.table_id]:
+                        if not (res.end_time <= start or res.start_time >= end):
+                            print(f"[CRITICAL DETECTED] Overlap error at node {engine.location_id} on Table {res.table_id}!")
+                            all_ok = False
+                    allocated_spans[res.table_id].append((res.start_time, res.end_time))
+        if all_ok:
+            print("[Auditor Log] Complete State Validated. Zero Double-Bookings Detected Across Ledgers.\n")
+
+# ==========================================
+# RUNTIME ENVIRONMENT SWEEP
 # ==========================================
 async def main():
-    # Setup Regional Environments (NYC vs London Timezones)
     nyc_tables = [Table("T1", 2, "NYC_1"), Table("T2", 4, "NYC_1")]
     lon_tables = [Table("L1", 2, "LON_1"), Table("L2", 4, "LON_1")]
     
-    nyc_engine = RegionalBookingEngine("NYC", "America/New_York", nyc_tables)
-    lon_engine = RegionalBookingEngine("LON", "Europe/London", lon_tables)
+    nyc_engine = RegionalBookingEngine("NYC_1", "America/New_York", nyc_tables)
+    lon_engine = RegionalBookingEngine("LON_1", "Europe/London", lon_tables)
     
-    # Initialize the Band mesh runtime context mapping
-    engine_directory = {"NYC": nyc_engine, "LON": lon_engine}
+   # escrow_system = EscrowHoldCoordinator(grace_period_minutes=0, deposit_amount=50.0)
+        # Set to -1 so the clock monitor expires instantly during your test sweep!
+    escrow_system = EscrowHoldCoordinator(grace_period_minutes=-1, deposit_amount=50.0)
+
     
-    builder = BandNegotiationAgents.BuilderAgent(nyc_engine, [lon_engine])
-    verifier = BandNegotiationAgents.VerifierAgent(engine_directory)
-    proposals = await NegotiationAgents.builder_propose_alternatives(nyc_engine, res2, partners=[lon_engine])
-    decision = await NegotiationAgents.verifier_audit(proposals, res2)
-
-
-    # Bootstrapping the Band Mesh Network Connection
-    print("[Band Runtime] Establishing persistent control plane mesh layer...")
-    await mesh.start()
-
-    # Simulate collision logic
-    base_time_utc = datetime.now(zoneinfo.ZoneInfo("UTC")).replace(hour=18, minute=0, second=0, microsecond=0)
-    res1 = Reservation("R101", party_size=2, start_time=base_time_utc.astimezone(nyc_engine.tz))
+    target_tz = zoneinfo.ZoneInfo("America/New_York")
+    now_dt = datetime.now(target_tz)
+    base_time = datetime(year=now_dt.year, month=now_dt.month, day=now_dt.day, hour=15, minute=0, tzinfo=target_tz)
     
-    # R101 captures the slot natively
-    await nyc_engine.attempt_booking(res1)
-    print(f"[Engine] R101 confirmed on local node: {res1.table_id}")
+    res1 = Reservation(str(uuid.uuid4()), 4, base_time, base_time + timedelta(hours=1))
+    success, msg = await nyc_engine.attempt_booking(res1)
+    await escrow_system.secure_hold(res1)
+    print(f"Res 1 Status: {success} -> {msg}")
 
-    # R102 fails locally -> fires Band Agent Workflow
-    print("\n[Band Desktop Dashboard] Task dispatched to SlotBuilderAgent due to local slot contention...")
-    builder_outcome = await builder.propose_alternatives(
-        res_id="R102", 
-        party_size=2, 
-        start_iso=res1.start_time.isoformat(), 
-        end_iso=res1.end_time.isoformat()
-    )
-    print(f"[Band Room Log] Builder Agent Output: {builder_outcome}")
+    res2 = Reservation(str(uuid.uuid4()), 4, base_time, base_time + timedelta(hours=1))
+    print("\n[Waitlist System Processing Overlap Collision Request...]")
+    success2, msg2 = await nyc_engine.attempt_booking(res2)
+    print(f"Res 2 Direct Booking Attempt: {success2} -> {msg2}")
+    
+    if not success2:
+        proposals = await NegotiationAgents.builder_propose_alternatives(nyc_engine, res2, partners=[lon_engine])
+        decision = await NegotiationAgents.verifier_audit(proposals, res2)
+        
+        if decision:
+            target_eng, target_start, target_end = decision
+            res2.start_time = target_start
+            res2.end_time = target_end
+            
+            final_success, final_msg = await target_eng.attempt_booking(res2)
+            local_start = res2.start_time.astimezone(target_eng.tz)
+            print(f"[Agent Success] Reallocated Res 2 to Venue Node: {target_eng.location_id} at {local_start.strftime('%I:%M %p')}. Status: {final_msg}")
 
+    # 👇 ENSURE THESE TWO LINES ARE NOT ACCIDENTALLY INDENTED INSIDE THE "if decision" BLOCK 👇
+    #await escrow_system.execute_clock_monitor(nyc_engine, res1)
+    #await CentralizedAuditor.global_sanity_check([nyc_engine, lon_engine])
+        clock_task = asyncio.create_task(escrow_system.execute_clock_monitor(nyc_engine, res1))
+    
+    # Yield control for a fraction of a second to let the background task register and process
+    await asyncio.sleep(0.1)
+    
+    # Run the continuous global state consistency auditor check
+    await CentralizedAuditor.global_sanity_check([nyc_engine, lon_engine])
+    
+    # Clean up the background task gracefully
+    await clock_task
+
+# THIS BLOCK MUST TOUCH THE FAR LEFT WALL WITH ZERO LEADING SPACES
 if __name__ == "__main__":
+    print("!!! INITIATING CORE SIMULATION LEDGER !!!")
     asyncio.run(main())
-
-
